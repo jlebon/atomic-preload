@@ -1,0 +1,153 @@
+#!/usr/bin/python3
+
+import os
+import sys
+import dbus
+import yaml
+import shutil
+import subprocess
+
+STOREDIR = "/var/lib/atomic/preload"
+BACKENDS = ['docker', 'ostree']
+
+DBUS_ATOMIC_NAME = "org.atomic"
+DBUS_ATOMIC_OBJPATH = "/org/atomic/object"
+DBUS_ATOMIC_IFACE = "org.atomic"
+
+def main():
+
+    # the service file already gates on this as well
+    if not os.path.isdir(STOREDIR):
+        exit()
+
+    for backend in BACKENDS:
+        store = os.path.join(STOREDIR, backend)
+        if os.path.isdir(store):
+            import_images_in_dir(backend, store)
+
+    config_path = os.path.join(STOREDIR, "config.yaml")
+    if os.path.isfile(config_path):
+        config = parse_config(config_path)
+        configure_containers(config)
+        os.unlink(config_path)
+
+def import_images_in_dir(backend, dir):
+
+    for dentry in os.listdir(dir):
+        path = os.path.join(dir, dentry)
+        if not os.path.isfile(path):
+            continue
+        if (not path.endswith(".tar") and
+            not path.endswith(".tar.gz") and
+            not path.endswith(".tar.xz")):
+                continue
+
+        print("INFO: importing %s into backend %s..." % (dentry, backend))
+
+        # XXX: needs patched handling for dockertar into docker daemon
+        subprocess.check_call(["/usr/bin/atomic", "pull", "--storage",
+                              backend, "dockertar:%s" % path])
+
+        os.unlink(path)
+
+def parse_config(config_path):
+
+    with open(config_path) as f:
+        config = yaml.safe_load(f.read())
+
+    # do some light format checking
+
+    if type(config) is not list or any([type(e) is not dict for e in config]):
+        raise Exception("ERROR: bad config: expected list of dicts")
+
+    def assert_key_in_dict(i, d, k, t, opt=False):
+        if k not in d:
+            if opt:
+                return
+            raise Exception("ERROR: bad config entry %d: "
+                            "missing key %s" % (i, k))
+        if type(d[k]) is not t:
+            raise Exception("ERROR: bad config entry %d: "
+                            "key %s is not type %s" % (i, k, str(t)))
+
+    for i, entry in enumerate(config):
+        assert_key_in_dict(i, entry, "name", str)
+        assert_key_in_dict(i, entry, "image", str)
+        assert_key_in_dict(i, entry, "install", dict, opt=True)
+        if "install" in entry:
+            assert_key_in_dict(i, entry["install"], "user", bool, opt=True)
+            assert_key_in_dict(i, entry["install"], "system", bool, opt=True)
+            assert_key_in_dict(i, entry["install"], "remote", str, opt=True)
+            assert_key_in_dict(i, entry["install"], "setvalues", list, opt=True)
+            assert_key_in_dict(i, entry["install"], "extra_args", list, opt=True)
+        assert_key_in_dict(i, entry, "run", dict, opt=True)
+        if "run" in entry:
+            assert_key_in_dict(i, entry["run"], "spc", bool, opt=True)
+            assert_key_in_dict(i, entry["run"], "extra_args", list, opt=True)
+
+    # Later entries for the same container name override
+    # earlier entries. This gives users an easy way to
+    # override the default config.
+    final_config = {}
+    for entry in config:
+        final_config[entry["name"]] = entry
+
+    return final_config
+
+def configure_containers(config):
+
+    bus = dbus.SystemBus()
+
+    for k in config:
+        entry = config[k]
+
+        name = entry["name"]
+        image = entry["image"]
+
+        if entry.get("install") is not None:
+            dispatch_install(bus, name, image, entry["install"])
+
+        # we need the explicit None check here since empty dicts are OK
+        if entry.get("run") is not None:
+            dispatch_run(bus, name, image, entry["run"])
+
+def dispatch_install(bus, name, image, args):
+
+    # transform the args to a list in the proper order
+    arglist = []
+    arglist.append(image)
+    arglist.append(name)
+    # XXX: needs patched dbus API signature
+    arglist.append(args.get("user", False))
+    arglist.append(args.get("system", False))
+    arglist.append(args.get("remote", ""))
+    arglist.append(args.get("setvalues", []))
+    arglist.append(args.get("extra_args", []))
+
+    print("INFO: install container %s" % name)
+
+    bus.call_blocking(DBUS_ATOMIC_NAME,
+                      DBUS_ATOMIC_OBJPATH,
+                      DBUS_ATOMIC_IFACE,
+                      "Install", "ssbbsasas", arglist)
+
+def dispatch_run(bus, name, image, args):
+
+    # transform the args to a list in the proper order
+    arglist = []
+    arglist.append(image)
+    arglist.append(name)
+    arglist.append(args.get("spc", False))
+    arglist.append(True) # detach is always True
+    # XXX: needs patched dbus API signature
+    arglist.append(args.get("extra_args", []))
+
+    print("INFO: starting container %s" % name)
+
+    bus.call_blocking(DBUS_ATOMIC_NAME,
+                      DBUS_ATOMIC_OBJPATH,
+                      DBUS_ATOMIC_IFACE,
+                      "Run", "ssbbas", arglist)
+
+if __name__ == '__main__':
+    sys.exit(main())

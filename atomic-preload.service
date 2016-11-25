@@ -1,0 +1,16 @@
+[Unit]
+Description=Atomic preloader for Docker containers
+ConditionPathIsDirectory=/var/lib/atomic/preload
+Requires=docker.service
+After=docker.service
+
+# Make sure users can override the default configurations
+# using the bootcmd or write_files modules.
+After=cloud-init.service
+
+[Service]
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/libexec/atomic-preload
+
+[Install]
+WantedBy=multi-user.target
